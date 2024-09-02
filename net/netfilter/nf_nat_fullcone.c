@@ -1379,6 +1379,8 @@ static unsigned int nf_nat_handle_postrouting(u8 nfproto, struct sk_buff *skb, u
 			is_src_mapping_active = src_mapping != NULL && check_mapping(src_mapping, net, zone);
 		} else if (nfproto == NFPROTO_IPV6) {
 			is_src_mapping_active = src_mapping_6 != NULL && check_mapping6(src_mapping_6, net, zone);
+		} else {
+			is_src_mapping_active = false;
 		}
 
 		if (is_src_mapping_active) {
@@ -1430,6 +1432,8 @@ static unsigned int nf_nat_handle_postrouting(u8 nfproto, struct sk_buff *skb, u
 
 				want_port =
 				    find_appropriate_port6(net, zone, original_port, &newrange->min_addr, range);
+			} else {
+				want_port = 0;
 			}
 
 			newrange->flags = NF_NAT_RANGE_MAP_IPS | NF_NAT_RANGE_PROTO_SPECIFIED;
