@@ -1095,6 +1095,107 @@ void release_async_work(struct ksmbd_work *work)
 	}
 }
 
+static int smb2_send_interim_work(struct ksmbd_work *in_work,
+				  struct ksmbd_work *work, bool eor)
+{
+	int err = 0;
+
+	in_work->encrypted = work->encrypted;
+	if (work->encrypted && work->sess && work->sess->enc &&
+	    work->conn->ops->encrypt_resp) {
+		in_work->sess = work->sess;
+		err = work->conn->ops->encrypt_resp(in_work);
+		in_work->sess = NULL;
+	}
+	if (err)
+		return err;
+
+	return ksmbd_conn_write(in_work);
+}
+
+static int smb2_send_interim_prefix_work(struct ksmbd_work *work)
+{
+	struct ksmbd_work *in_work;
+	unsigned int len, copied = 0;
+	char *dst;
+	int err = -ENOMEM;
+	int i;
+
+	len = get_rfc1002_len(work->iov[0].iov_base);
+	in_work = ksmbd_alloc_work_struct();
+	if (!in_work)
+		return err;
+
+	in_work->response_buf = kvzalloc(len + 4, KSMBD_DEFAULT_GFP);
+	if (!in_work->response_buf)
+		goto out;
+	in_work->response_sz = len + 4;
+	in_work->conn = work->conn;
+	dst = in_work->response_buf + 4;
+	for (i = 1; i <= work->iov_idx; i++) {
+		if (work->iov[i].iov_len > len - copied) {
+			err = -EINVAL;
+			goto out;
+		}
+		memcpy(dst + copied, work->iov[i].iov_base,
+		       work->iov[i].iov_len);
+		copied += work->iov[i].iov_len;
+	}
+	if (copied != len) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	err = ksmbd_iov_pin_rsp(in_work, dst, len);
+	if (!err)
+		err = smb2_send_interim_work(in_work, work, true);
+out:
+	ksmbd_free_work_struct(in_work);
+	return err;
+}
+
+static void smb2_send_interim_compound_prefix(struct ksmbd_work *work)
+{
+	struct smb2_hdr *req_hdr;
+	struct smb2_hdr *rsp_hdr;
+	int err;
+
+	if (!work->next_smb2_rcv_hdr_off ||
+	    !work->next_smb2_rsp_hdr_off ||
+	    work->curr_smb2_rsp_hdr_off == work->next_smb2_rsp_hdr_off ||
+	    !work->iov_idx)
+		return;
+
+	req_hdr = ksmbd_req_buf_next(work);
+	/* Detach only the final async command from the completed prefix. */
+	if (req_hdr->NextCommand)
+		return;
+
+	/*
+	 * The responses before the async command are sent as a standalone
+	 * compound response. The last response in this prefix must terminate
+	 * the chain.
+	 */
+	rsp_hdr = ksmbd_resp_buf_curr(work);
+	rsp_hdr->NextCommand = 0;
+	if ((rsp_hdr->Flags & SMB2_FLAGS_SIGNED) && work->sess &&
+	    work->conn->ops->set_sign_rsp)
+		work->conn->ops->set_sign_rsp(work);
+
+	err = smb2_send_interim_prefix_work(work);
+	if (err)
+		ksmbd_debug(SMB, "failed to send compound interim prefix: %d\n",
+			    err);
+
+	work->iov_idx = 0;
+	work->iov_cnt = 0;
+	work->curr_smb2_rsp_hdr_off = work->next_smb2_rsp_hdr_off;
+	*(__be32 *)work->response_buf = 0;
+
+	rsp_hdr = ksmbd_resp_buf_next(work);
+	rsp_hdr->Flags &= ~SMB2_FLAGS_RELATED_OPERATIONS;
+}
+
 void smb2_send_interim_resp(struct ksmbd_work *work, __le32 status)
 {
 	struct smb2_hdr *rsp_hdr;
@@ -1109,6 +1210,9 @@ void smb2_send_interim_resp(struct ksmbd_work *work, __le32 status)
 		return;
 	}
 
+	if (status == STATUS_PENDING)
+		smb2_send_interim_compound_prefix(work);
+
 	in_work->conn = work->conn;
 	memcpy(smb_get_msg(in_work->response_buf), ksmbd_resp_buf_next(work),
 	       __SMB2_HEADER_STRUCTURE_SIZE);
@@ -1119,7 +1223,8 @@ void smb2_send_interim_resp(struct ksmbd_work *work, __le32 status)
 	smb2_set_err_rsp(in_work);
 	rsp_hdr->Status = status;
 
-	ksmbd_conn_write(in_work);
+	if (smb2_send_interim_work(in_work, work, true))
+		ksmbd_debug(SMB, "failed to send interim response\n");
 	ksmbd_free_work_struct(in_work);
 }
 
@@ -10405,6 +10510,7 @@ int smb2_notify(struct ksmbd_work *work)
 	struct ksmbd_work *in_work;
 	struct smb2_hdr *in_hdr;
 	struct ksmbd_file *fp;
+	u64 id, pid;
 
 	ksmbd_debug(SMB, "Received smb2 notify\n");
 
@@ -10419,14 +10525,28 @@ int smb2_notify(struct ksmbd_work *work)
 		return -EIO;
 	}
 
+	id = req->VolatileFileId;
+	pid = req->PersistentFileId;
+	if (work->next_smb2_rcv_hdr_off &&
+	    (req->hdr.Flags & SMB2_FLAGS_RELATED_OPERATIONS)) {
+		if (!has_file_id(work->compound_fid)) {
+			rsp->hdr.Status = STATUS_INVALID_HANDLE;
+			smb2_set_err_rsp(work);
+			return 0;
+		}
+		id = work->compound_fid;
+		pid = work->compound_pfid;
+	}
+
 	/*
 	 * macOS backupd sends CHANGE_NOTIFY with FileId=FFFF...FFFF (share-root
 	 * sentinel) to watch for changes on the share root without holding an
 	 * open handle. Respond STATUS_PENDING + STATUS_NOTIFY_CLEANUP immediately;
 	 * without this, backupd aborts Time Machine setup on STATUS_FILE_CLOSED.
 	 */
-	if (req->VolatileFileId == SMB2_NO_FID &&
-	    req->PersistentFileId == SMB2_NO_FID) {
+	if (!work->next_smb2_rcv_hdr_off && !req->hdr.NextCommand &&
+	    !(req->hdr.Flags & SMB2_FLAGS_RELATED_OPERATIONS) &&
+	    id == SMB2_NO_FID && pid == SMB2_NO_FID) {
 		in_work = ksmbd_alloc_work_struct();
 		if (!in_work || allocate_interim_rsp_buf(in_work)) {
 			if (in_work)
@@ -10470,7 +10590,7 @@ int smb2_notify(struct ksmbd_work *work)
 	 * STATUS_NOT_IMPLEMENTED here (like stock ksmbd) makes macOS smbfs
 	 * hard-freeze on unmount, so this must stay deferred.
 	 */
-	fp = ksmbd_lookup_fd_slow(work, req->VolatileFileId, req->PersistentFileId);
+	fp = ksmbd_lookup_fd_slow(work, id, pid);
 	if (!fp) {
 		rsp->hdr.Status = STATUS_FILE_CLOSED;
 		smb2_set_err_rsp(work);
