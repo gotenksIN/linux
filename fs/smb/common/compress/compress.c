@@ -130,12 +130,19 @@ static int smb_decompress_chained(__le16 alg, bool allow_chained,
 		len = le32_to_cpu(payload->Length);
 
 		/*
-		 * CHAINED marks only the first payload. Requiring NONE on every
-		 * later payload rejects ambiguous or independently chained data.
+		 * The first payload header MUST specify SMB2_COMPRESSION_FLAG_CHAINED.
+		 * Subsequent payload headers in a conforming chain should carry
+		 * SMB2_COMPRESSION_FLAG_NONE, but clients (such as Windows) may omit
+		 * zeroing the flags field for trailing segments. Do not reject
+		 * valid payloads as long as they do not initiate an unhandled nested chain.
 		 */
-		if ((first && flags != cpu_to_le16(SMB2_COMPRESSION_FLAG_CHAINED)) ||
-		    (!first && flags != cpu_to_le16(SMB2_COMPRESSION_FLAG_NONE)))
-			return -EINVAL;
+		if (first) {
+			if (flags != cpu_to_le16(SMB2_COMPRESSION_FLAG_CHAINED))
+				return -EINVAL;
+		} else {
+			if (flags == cpu_to_le16(SMB2_COMPRESSION_FLAG_CHAINED))
+				return -EINVAL;
+		}
 
 		src += SMB2_COMPRESSION_PAYLOAD_BASE_LEN;
 		remaining -= SMB2_COMPRESSION_PAYLOAD_BASE_LEN;
