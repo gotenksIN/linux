@@ -360,15 +360,22 @@ static int nf_dev_fill_forward_path(const struct nf_flow_route *route,
 				     const struct dst_entry *dst_cache,
 				     const struct nf_conn *ct,
 				     enum ip_conntrack_dir dir, u8 *ha,
+				     __be16 ether_type,
 				     struct net_device_path_stack *stack)
 {
 	const void *daddr = &ct->tuplehash[!dir].tuple.src.u3;
 	struct net_device *dev = dst_cache->dev;
+	struct net_device_path_ctx ctx = {
+		.dev = dev,
+		.ether_type = ether_type,
+	};
 	struct neighbour *n;
 	u8 nud_state;
 
-	if (!nf_is_valid_ether_device(dev))
+	if (!nf_is_valid_ether_device(dev)) {
+		eth_zero_addr(ha);
 		goto out;
+	}
 
 	n = dst_neigh_lookup(dst_cache, daddr);
 	if (!n)
@@ -384,13 +391,16 @@ static int nf_dev_fill_forward_path(const struct nf_flow_route *route,
 		return -1;
 
 out:
-	return dev_fill_forward_path(dev, ha, stack);
+	ether_addr_copy(ctx.daddr, ha);
+
+	return dev_fill_forward_path(&ctx, stack);
 }
 
 static void nf_dev_forward_path(struct nf_flow_route *route,
 				const struct nf_conn *ct,
 				enum ip_conntrack_dir dir,
-				struct net_device **devs)
+				struct net_device **devs,
+				__be16 ether_type)
 {
 	const struct dst_entry *dst = route->tuple[dir].dst;
 	struct net_device_path_stack stack;
@@ -398,8 +408,19 @@ static void nf_dev_forward_path(struct nf_flow_route *route,
 	unsigned char ha[ETH_ALEN];
 	int i;
 
-	if (nf_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
-		nf_dev_path_info(&stack, &info, ha);
+	if (nf_dev_fill_forward_path(route, dst, ct, dir, ha, ether_type,
+				     &stack) < 0)
+		return;
+
+	for (i = 0; i < stack.num_paths; i++) {
+		if (stack.path[i].type == DEV_PATH_TUN) {
+			dev_fill_forward_path_release(&stack);
+			return;
+		}
+	}
+
+	nf_dev_path_info(&stack, &info, ha);
+	dev_fill_forward_path_release(&stack);
 
 	devs[!dir] = (struct net_device *)info.indev;
 	if (!info.indev)
@@ -454,8 +475,8 @@ xt_flowoffload_route(struct sk_buff *skb, const struct nf_conn *ct,
 
 	if (route->tuple[dir].xmit_type	== FLOW_OFFLOAD_XMIT_NEIGH &&
 	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
-		nf_dev_forward_path(route, ct, dir, devs);
-		nf_dev_forward_path(route, ct, !dir, devs);
+		nf_dev_forward_path(route, ct, dir, devs, skb->protocol);
+		nf_dev_forward_path(route, ct, !dir, devs, skb->protocol);
 	}
 
 	return 0;
