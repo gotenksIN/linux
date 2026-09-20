@@ -643,7 +643,7 @@ static int binderfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		return -ENOMEM;
 	info = sb->s_fs_info;
 
-	info->ipc_ns = get_ipc_ns_exported(current->nsproxy->ipc_ns);
+	info->ipc_ns = get_ipc_ns(current->nsproxy->ipc_ns);
 
 	info->root_gid = make_kgid(sb->s_user_ns, 0);
 	if (!gid_valid(info->root_gid))
