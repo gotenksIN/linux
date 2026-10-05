@@ -132,7 +132,6 @@ ifeq ($(CONFIG_X86_32),y)
 
         # CPU-specific tuning. Anything which can be shared with UML should go here.
         include $(srctree)/arch/x86/Makefile_32.cpu
-        KBUILD_CFLAGS += $(cflags-y)
 
         percpu_seg := fs
 else

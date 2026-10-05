@@ -478,7 +478,6 @@ config ARCH_WANT_HUGETLB_VMEMMAP_PREINIT
 
 config ANON_MIN_RATIO
 	int "Default value for vm.anon_min_ratio"
-	depends on SYSCTL
 	range 0 100
 	default 15
 	help
@@ -496,7 +495,6 @@ config ANON_MIN_RATIO
 
 config CLEAN_LOW_RATIO
 	int "Default value for vm.clean_low_ratio"
-	depends on SYSCTL
 	range 0 100
 	default 0
 	help
@@ -518,7 +516,6 @@ config CLEAN_LOW_RATIO
 
 config CLEAN_MIN_RATIO
 	int "Default value for vm.clean_min_ratio"
-	depends on SYSCTL
 	range 0 100
 	default 15
 	help

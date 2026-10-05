@@ -26,8 +26,17 @@ cflags-$(CONFIG_MGEODE_LX)	+= $(call cc-option,-march=geode,-march=pentium-mmx)
 # cpu entries
 cflags-$(CONFIG_X86_GENERIC) 	+= $(call tune,generic,$(call tune,i686))
 
+ifdef CONFIG_X86_32
+        KBUILD_CFLAGS += $(cflags-y)
+endif
+
 # x86_64 instruction set
 ifdef CONFIG_X86_NATIVE_CPU
+ifdef CONFIG_RUST
+ifneq ($(CONFIG_RUSTC_HAS_APXF),y)
+        $(error Native CPU builds require a Rust toolchain with APX gating support)
+endif
+endif
         KBUILD_CFLAGS += -march=native
         # Prevent the compiler from generating EGPR use. The kernel is
         # not yet prepared for general in-kernel use.
